@@ -4,10 +4,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 Auteurs : Gabriel C. Ullmann, Fabio Petrillo, 2025
 """
 from typing import Dict, Any
-import requests
 import config
+from db import get_sqlalchemy_session
 from event_management.base_handler import EventHandler
 from orders.commands.order_event_producer import OrderEventProducer
+from payments.models.outbox import Outbox
+from payments.outbox_processor import OutboxProcessor
 
 
 class StockDecreasedHandler(EventHandler):
@@ -23,29 +25,24 @@ class StockDecreasedHandler(EventHandler):
 
     def handle(self, event_data: Dict[str, Any]) -> None:
         """Execute every time the event is published"""
-        # Le stock a été diminué, alors créez la transaction de paiement (appel synchrone à l'API Payments, comme au labo 6).
-        # NOTE: l'activité 6 (Outbox) remplacera cet appel direct par un enregistrement dans la table Outbox + OutboxProcessor.
+        # Le stock a été diminué : au lieu d'appeler l'API Payments tout de suite, on enregistre d'abord la demande
+        # de paiement dans la table Outbox. Si l'application s'arrête avant la fin, OutboxProcessor la reprendra au redémarrage.
+        session = get_sqlalchemy_session()
         try:
-            response = requests.post('http://api-gateway:8080/payments-api/payments',
-                json={
-                    "user_id": event_data['user_id'],
-                    "order_id": event_data['order_id'],
-                    "total_amount": event_data['total_amount']
-                },
-                headers={'Content-Type': 'application/json'},
-                timeout=5
-            )
-            if not response.ok:
-                raise Exception(f"Erreur {response.status_code} : {response.text}")
-
-            # Si la transaction de paiement a été crée, déclenchez PaymentCreated.
-            event_data['payment_id'] = response.json()['payment_id']
-            event_data['event'] = "PaymentCreated"
+            new_outbox_item = Outbox(order_id=event_data['order_id'],
+                                    user_id=event_data['user_id'],
+                                    total_amount=event_data['total_amount'],
+                                    order_items=event_data['order_items'])
+            session.add(new_outbox_item)
+            session.flush()
+            session.commit()
+            # OutboxProcessor appelle l'API Payments et déclenche PaymentCreated ou PaymentCreationFailed
+            OutboxProcessor().run(new_outbox_item)
         except Exception as e:
-            # Si la transaction de paiement n'était pas crée, déclenchez PaymentCreationFailed.
+            session.rollback()
             self.logger.debug("La création d'une transaction de paiement a échoué : " + str(e))
             event_data['event'] = "PaymentCreationFailed"
             event_data['error'] = str(e)
-        finally:
-            self.logger.debug(f"payment_link={event_data['payment_link']}")
             OrderEventProducer().get_instance().send(config.KAFKA_TOPIC, value=event_data)
+        finally:
+            session.close()
