@@ -6,7 +6,7 @@ Auteurs : Gabriel C. Ullmann, Fabio Petrillo, 2025
 from datetime import datetime
 import requests
 import config
-from db import get_sqlalchemy_session
+from db import get_sqlalchemy_session, get_redis_conn
 from logger import Logger
 from orders.commands.order_event_producer import OrderEventProducer
 from orders.commands.write_order import modify_order
@@ -51,15 +51,23 @@ class OutboxProcessor():
             payment_response = self._request_payment_transaction(outbox_item)
             if payment_response.ok:
                 data = payment_response.json() 
-                order = session.query(Outbox).filter(Outbox.order_id == outbox_item.order_id).first()
+                # Marquer CET enregistrement (par son id) : une commande peut avoir plusieurs lignes Outbox si un événement est relu
+                order = session.query(Outbox).filter(Outbox.id == outbox_item.id).first()
                 order.payment_id = data['payment_id']
                 session.commit()
-                # TODO: après la mise à jour à MySQL, il faut également mettre la commande à jour dans Redis
-                # Vous pouvez réutiliser le code présent dans OrderController, lignes 40-43
                 update_succeeded = modify_order(event_data["order_id"], True, order.payment_id)
+                event_data["payment_id"] = order.payment_id
                 event_data["payment_link"] = f"http://api-gateway:8080/payments-api/payments/process/{order.payment_id}"
                 if not update_succeeded:
                     raise Exception(f"Erreur : la mise à jour de la commande après la génération du paiement a échoué.")
+
+                # Après MySQL, mettre aussi la commande à jour dans Redis (même logique que OrderController.update_order)
+                r = get_redis_conn()
+                if r.exists(f"order:{event_data['order_id']}"):
+                    r.hset(f"order:{event_data['order_id']}", mapping={
+                        "is_paid": str(True),
+                        "payment_link": event_data["payment_link"]
+                    })
             else:
                 text = payment_response.json() 
                 raise Exception(f"Error {payment_response.status_code} : {text}")
