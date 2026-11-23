@@ -95,6 +95,19 @@ services:
     networks:
       - labo08-network
 
+  locust:
+    image: locustio/locust:2.32.4
+    container_name: locust
+    ports:
+      - "8089:8089"
+    volumes:
+      - ./locustfiles:/mnt/locust
+    command: -f /mnt/locust/locustfile.py --host http://store_manager:5000
+    networks:
+      - labo08-network
+    depends_on:
+      - store_manager
+
 networks:
   labo08-network:
     external: true
